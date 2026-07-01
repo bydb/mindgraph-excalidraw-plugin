@@ -191,6 +191,14 @@ function ExcalidrawEditor({ filePath, host }: { filePath: string; host: PluginRe
           return
         }
         const restored = restore(scene as never, null, null)
+        // F11 (Rest): die Default-Schrift für NEUE Elemente (appState.currentItemFontFamily) auf eine
+        // eingebettete normalisieren, falls die Szene eine nicht eingebettete mitbringt (z. B. Helvetica).
+        // Sonst würde neu erstellter Text gegen den plattformabhängigen Fallback driften, obwohl alle
+        // vorhandenen Elemente eingebettete Familien nutzen. restore() lässt currentItemFontFamily sonst stehen.
+        const curFont = (restored.appState as { currentItemFontFamily?: number }).currentItemFontFamily
+        if (typeof curFont === 'number' && !EMBEDDED_FONT_IDS.has(curFont)) {
+          ;(restored.appState as { currentItemFontFamily?: number }).currentItemFontFamily = FONT_FAMILY.Excalifont
+        }
         setInitialData(restored)
         // Baseline setzen BEVOR Editing aktiv wird (Hydration-Guard über phase==='ready').
         controller.setBaseline(serializeAsJSON(restored.elements, restored.appState, restored.files ?? {}, 'local'))
