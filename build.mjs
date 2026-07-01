@@ -215,6 +215,10 @@ async function build() {
   cssContent = `${dataFontFaces}${cssContent.replace(/@font-face\s*\{[^}]*\}/g, '')}`
   writeFileSync(resolve(__dirname, 'dist/styles.css'), cssContent)
 
+  // Manifest neben die Entrypoints legen → dist/ = das vollständige Artefakt (manifest + entrypoints),
+  // damit sowohl scripts/pack.mjs (Dev-Key) als auch der zentrale Prod-Signierer (ARTIFACT_DIR=dist) es 1:1 packen.
+  writeFileSync(resolve(__dirname, 'dist/manifest.json'), readFileSync(resolve(__dirname, 'manifest.json')))
+
   // --- 3. Größen-Report (F09) ---
   const jsSize = statSync(resolve(__dirname, 'dist/renderer.js')).size
   const cssSize = statSync(resolve(__dirname, 'dist/styles.css')).size

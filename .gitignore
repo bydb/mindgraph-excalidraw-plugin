@@ -1,4 +1,12 @@
 node_modules/
 dist/
 *.mgxplugin
+releases/*.mgxplugin
 .DS_Store
+
+# Schlüsselmaterial — NIE committen (zweite Sperre; der Dev-Key lebt ohnehin außerhalb des Projekts)
+*.dev-key.json
+*keyring*
+*.pem
+*.key
+*secret*
