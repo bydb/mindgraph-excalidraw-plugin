@@ -10,7 +10,7 @@
 //          dem Renderer-Teardown, daher wird kontinuierlich (debounced) während des Editierens gespeichert.
 // F05: Excalidraws native Datei-/Export-Oberflächen (Öffnen/Speichern/Export/Menu) sind abgeschaltet.
 
-import { Excalidraw, MainMenu, serializeAsJSON, restore } from '@excalidraw/excalidraw'
+import { Excalidraw, MainMenu, serializeAsJSON, restore, FONT_FAMILY } from '@excalidraw/excalidraw'
 import { createRoot, type Root } from 'react-dom/client'
 import { useCallback, useEffect, useRef, useState } from 'react'
 
@@ -46,6 +46,16 @@ const SUPPORTED_FONT_FAMILIES = [
   'Lilita One',
   'Liberation Sans',
 ] as const
+
+// F11 (fail-closed): fontFamily-IDs der 7 eingebetteten Familien, aus Excalidraws FONT_FAMILY-Registry
+// (Virgil:1, Cascadia:3, Excalifont:5, Nunito:6, "Lilita One":7, "Comic Shanns":8, "Liberation Sans":9).
+// Eine Szene mit einer NICHT eingebetteten Familie (Helvetica=2 = „Helvetica on macOS, Arial on Win", oder
+// CJK/Xiaolai) misst gegen den plattformabhängigen local()-/Fallback-Font → nicht portable Geometrie.
+const EMBEDDED_FONT_IDS = new Set<number>(
+  SUPPORTED_FONT_FAMILIES
+    .map((f) => (FONT_FAMILY as Record<string, number>)[f])
+    .filter((id): id is number => typeof id === 'number'),
+)
 
 /**
  * Serialisierter, coalescender Save-Controller (F03): höchstens EIN vault.write in flight; danach immer den
@@ -96,7 +106,7 @@ class SaveController {
 }
 
 function ExcalidrawEditor({ filePath, host }: { filePath: string; host: PluginRendererHost }): JSX.Element {
-  const [phase, setPhase] = useState<'loading' | 'ready' | 'load-error' | 'font-error'>('loading')
+  const [phase, setPhase] = useState<'loading' | 'ready' | 'load-error' | 'font-error' | 'unsupported-font'>('loading')
   const [fontError, setFontError] = useState<string>('')
   const [initialData, setInitialData] = useState<ReturnType<typeof restore> | null>(null)
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'error'>('idle')
@@ -134,6 +144,21 @@ function ExcalidrawEditor({ filePath, host }: { filePath: string; host: PluginRe
           }
         }
         if (cancelled) return
+        // F11 (fail-closed): eine importierte/Legacy-Szene kann eine NICHT eingebettete Familie nutzen
+        // (Helvetica ID 2, oder CJK/Xiaolai). Die misst gegen den plattformabhängigen Fallback → driftende,
+        // nicht portable gespeicherte Geometrie. Analog zum Font-Preload: dann NICHT ready+speichern, sondern
+        // read-only. Neue/leere Szenen (Default = eingebettetes Excalifont) sind unberührt.
+        const usedFontIds = new Set<number>()
+        for (const el of (((scene as { elements?: unknown })?.elements ?? []) as Array<{ type?: string; fontFamily?: number }>)) {
+          if (el?.type === 'text' && typeof el.fontFamily === 'number') usedFontIds.add(el.fontFamily)
+        }
+        const unsupportedIds = [...usedFontIds].filter((id) => !EMBEDDED_FONT_IDS.has(id))
+        if (unsupportedIds.length > 0) {
+          host.log('Szene nutzt nicht eingebettete Schrift(en) (fail-closed, read-only):', unsupportedIds)
+          setFontError(`fontFamily ${unsupportedIds.join(', ')} (z. B. Helvetica = ID 2, oder CJK) — nicht eingebettet.`)
+          setPhase('unsupported-font')
+          return
+        }
         // F01+F10 (fail-closed): die eingebetteten Canvas-Fonts laden, BEVOR Excalidraw rendert/misst — sonst
         // misst measureText gegen den System-Fallback und persistiert falsche Textgeometrie (Cross-Tool/Cross-
         // OS-Drift). Wir rufen FontFace.load() auf den CSS-registrierten data:-Faces auf (NICHT
@@ -205,6 +230,17 @@ function ExcalidrawEditor({ filePath, host }: { filePath: string; host: PluginRe
       <div style={msgStyle}>
         Schriften konnten nicht geladen werden — Bearbeitung ist deaktiviert (read-only), um falsche, dauerhaft
         gespeicherte Textgeometrie zu vermeiden.
+        <br />
+        <span style={{ fontSize: 11, opacity: 0.7 }}>{fontError}</span>
+      </div>
+    )
+  }
+  if (phase === 'unsupported-font') {
+    return (
+      <div style={msgStyle}>
+        Diese Zeichnung nutzt eine Schrift, die dieses Plugin nicht einbettet (z. B. Helvetica oder CJK). Sie ist
+        schreibgeschützt geöffnet, damit keine plattformabhängige (macOS/Windows/Linux unterschiedliche) Text-
+        geometrie dauerhaft gespeichert wird.
         <br />
         <span style={{ fontSize: 11, opacity: 0.7 }}>{fontError}</span>
       </div>

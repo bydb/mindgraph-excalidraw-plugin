@@ -1,6 +1,6 @@
 {
   "name": "mindgraph-excalidraw-plugin",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "description": "Excalidraw Zeichen-Editor als signiertes MindGraph Renderer-Plugin",
   "type": "module",
