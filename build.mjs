@@ -93,7 +93,7 @@ export const EMBEDDED_FONTS = [
 // Ein Excalidraw-Update kann Funktionsnamen/Minifizierung ändern → ein Regex matcht 0× → der Build bliebe
 // grün, aber die esm.sh-Font-Fetches (+230 CSP-Fehler) kämen still zurück. Nach dem Build wird gegen erwartete
 // Mindest-Counts + einen Post-Build-Grep asserted (Build rot bei Miss). Siehe Font-Shim-Gate in build().
-const fontPatchCounts = { createUrls: 0, loadFontFaces: 0, fontsLoad: 0, fetchFont: 0, genFontFace: 0 }
+const fontPatchCounts = { createUrls: 0, loadFontFaces: 0, fontsLoad: 0, fetchFont: 0, genFontFace: 0, swatchTitle: 0 }
 function countReplace(code, re, repl, key) {
   const m = code.match(re)
   if (m) fontPatchCounts[key] += re.global ? m.length : 1
@@ -154,6 +154,12 @@ const fontSubsettingShimPlugin = {
 
       // (5) generateFontFaceDeclarations → return[] (SVG-Export-Font-CSS-Pfad abtöten)
       code = countReplace(code, /(static async generateFontFaceDeclarations\([^)]*\)\s*\{)/, '$1return[];', 'genFontFace')
+
+      // (6) Farb-Swatch-Tooltip abschalten (User-Wunsch): das native `title:<hex>` am Farb-Swatch-Button
+      //     entfernen. Im eingebetteten App-Kontext rendert der Browser diesen nativen Tooltip beim Hover
+      //     verzerrt über dem Swatch. Backreference sichert, dass es GENAU der Swatch-Button ist
+      //     (`--swatch-color`-Var == `title`-Var). Toolbar-/andere Tooltips (`.excalidraw-tooltip`) bleiben.
+      code = countReplace(code, /("--swatch-color":([A-Za-z_$][\w$]*)\},type:"button",)title:\2,/, '$1', 'swatchTitle')
 
       return { contents: code, loader: 'js' }
     })
@@ -250,7 +256,7 @@ async function build() {
   const exVersion = JSON.parse(readFileSync(resolve(excalidrawDir, '../../package.json'), 'utf-8')).version
   if (exVersion !== '0.18.1') gateFail.push(`@excalidraw/excalidraw@${exVersion} ≠ 0.18.1 — Font-Patch neu auditieren`)
   // (b) exakte Patch-Counts
-  const EXPECT_COUNTS = { createUrls: 1, loadFontFaces: 1, fontsLoad: 2, fetchFont: 1, genFontFace: 1 }
+  const EXPECT_COUNTS = { createUrls: 1, loadFontFaces: 1, fontsLoad: 2, fetchFont: 1, genFontFace: 1, swatchTitle: 1 }
   for (const [key, exact] of Object.entries(EXPECT_COUNTS)) {
     if (fontPatchCounts[key] !== exact) gateFail.push(`Patch-Count ${key}=${fontPatchCounts[key]} (erwartet exakt ${exact})`)
   }
