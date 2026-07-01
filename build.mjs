@@ -31,6 +31,50 @@ const fontSubsettingShimPlugin = {
     build.onResolve({ filter: /subset-worker\.chunk\.js$/ }, (args) => ({
       path: resolve(__dirname, 'shims/subset-worker.js'),
     }))
+
+    // F02: Excalidraw lädt zur Laufzeit 230 Font-Subsets (immer inkl. cross-origin ASSETS_FALLBACK_URL)
+    // via FontFace → Host-CSP (default-src 'self') blockt jede einzelne (230 Konsolen-Fehler). Wir haben
+    // KEINE lokale Font-Quelle (external Plugin kann keine Dateien servieren; 13 MB Fonts data:-inline
+    // wäre absurd). Darum neutralisieren wir den Font-Ladepfad an DER WURZEL + allen downstream-Pfaden:
+    //
+    // (1) createUrls → return[] — DIE WURZEL: die einzige Stelle, die new URL(uri, ASSETS_FALLBACK_URL)
+    //     konstruiert. Wenn sie [] zurückgibt, werden NIE esm.sh-URL-Objekte erzeugt. FontFace-Konstruktor
+    //     bekommt leeren Source (ungiftig, wird nie geladen da nie .add() oder .load()).
+    // (2) ASSETS_FALLBACK_URL → "" — nuklear: selbst wenn createUrls irgendwie läuft, fällt die URL auf leer.
+    // (3) loadFontFaces → return[] — Bulk-Font-Loader (document.fonts.add) früh terminieren.
+    // (4) document.fonts.load( → (async()=>[])( — die 2 Aufrufe in fontFacesLoader/loadElementsFonts.
+    // (5) fetchFont → fetch() ersetzen durch Promise.reject — der EINZIGE echte fetch()-Call für Fonts
+    //     (in getContent → toCSS → fontFacesStylesGenerator → generateFontFaceDeclarations, SVG-Export).
+    //     Belt-and-suspenders: selbst wenn ein Pfad zu fetchFont führt, kein network request.
+    // (6) generateFontFaceDeclarations → return[] — SVG-Export-Font-CSS-Pfad komplett abtöten.
+    //
+    // Ergebnis: 0 Font-URLs konstruiert, 0 FontFace-Objekte in document.fonts, 0 fetch()-Calls, 0 CSP-Errors.
+    // Shapes bleiben handgezeichnet via rough.js; Text nutzt System-Fallback (kein Virgil/Excalifont).
+    build.onLoad({ filter: /@excalidraw[/\\]excalidraw[/\\]dist[/\\]prod[/\\][^/\\]+\.js$/ }, (args) => {
+      let code = readFileSync(args.path, 'utf8')
+
+      // (1) createUrls → return[] (WURZEL — tötet alle URL-Konstruktion)
+      code = code.replace(/(static createUrls\([^)]*\)\s*\{)/, '$1return[];')
+
+      // (2) loadFontFaces → return[] (kein document.fonts.add)
+      code = code.replace(/(static async loadFontFaces\([^)]*\)\s*\{)/, '$1return[];')
+
+      // (4) document.fonts.load( → (async()=>[])( (kein Font-Fetch via Font Loading API)
+      code = code.replace(/(?:window\.)?document\.fonts\.load\(/g, '(async()=>[])(')
+
+      // (5) fetchFont: fetch(t,{cache:"force-cache",...}) → Promise.reject (kein network request)
+      //     Der pattern matcht den fetch()-Call im fetchFont-Body; spezifisch genug (cache:"force-cache"
+      //     + Accept:"font/woff2" kommt nur in fetchFont vor).
+      code = code.replace(
+        /fetch\(\s*t\s*,\s*\{\s*cache:\s*"force-cache"\s*,\s*headers:\s*\{\s*Accept:\s*"font\/woff2"\s*\}\s*\}\s*\)/,
+        'Promise.reject(new Error("font fetch disabled by build-shim"))',
+      )
+
+      // (6) generateFontFaceDeclarations → return[] (SVG-Export-Font-CSS-Pfad abtöten)
+      code = code.replace(/(static async generateFontFaceDeclarations\([^)]*\)\s*\{)/, '$1return[];')
+
+      return { contents: code, loader: 'js' }
+    })
   },
 }
 
@@ -45,6 +89,7 @@ async function build() {
     platform: 'browser',
     splitting: false,
     minify: true,
+    jsx: 'automatic',
     sourcemap: false,
     target: ['es2022', 'chrome120'],
     outfile: resolve(__dirname, 'dist/renderer.js'),

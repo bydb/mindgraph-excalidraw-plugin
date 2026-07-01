@@ -8,7 +8,7 @@
   "apiVersion": "^0.2.0",
   "minAppVersion": "0.9.0-beta",
   "author": { "name": "MindGraph" },
-  "repo": "bydb/mindgraph-excalidraw-plugin",
+  "repo": "https://github.com/bydb/mindgraph-excalidraw-plugin",
   "entrypoints": { "renderer": "renderer.js", "styles": "styles.css" },
   "capabilities": ["vault.read", "vault.write"],
   "ui": {
