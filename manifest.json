@@ -1,0 +1,17 @@
+{
+  "manifestVersion": 2,
+  "id": "mindgraph-excalidraw",
+  "version": "0.1.0",
+  "label": "Excalidraw",
+  "description": "Handgezeichneter Zeichen-Editor für .excalidraw-Dateien.",
+  "category": "documents",
+  "apiVersion": "^0.2.0",
+  "minAppVersion": "0.9.0-beta",
+  "author": { "name": "MindGraph" },
+  "repo": "bydb/mindgraph-excalidraw-plugin",
+  "entrypoints": { "renderer": "renderer.js", "styles": "styles.css" },
+  "capabilities": ["vault.read", "vault.write"],
+  "ui": {
+    "fileEditors": [{ "editorId": "excalidraw", "extensions": [".excalidraw"], "label": "Excalidraw" }]
+  }
+}

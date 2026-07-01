@@ -1,0 +1,4 @@
+node_modules/
+dist/
+*.mgxplugin
+.DS_Store
