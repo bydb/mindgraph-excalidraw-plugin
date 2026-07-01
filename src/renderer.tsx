@@ -34,6 +34,19 @@ interface PluginRendererModule {
   deactivate?(): void
 }
 
+// F09/F10: die Canvas-Font-Familien, die build.mjs als data:-@font-face einbettet (Nicht-CJK). MUSS mit der
+// `EMBEDDED_FONTS`-Liste in build.mjs übereinstimmen — vor jedem Mount wird verlangt, dass JEDE dieser Familien
+// lädt (fail-closed), sonst read-only. Nicht eingebettet: Xiaolai/CJK (dokumentierte Fallback-Grenze).
+const SUPPORTED_FONT_FAMILIES = [
+  'Excalifont',
+  'Nunito',
+  'Comic Shanns',
+  'Virgil',
+  'Cascadia',
+  'Lilita One',
+  'Liberation Sans',
+] as const
+
 /**
  * Serialisierter, coalescender Save-Controller (F03): höchstens EIN vault.write in flight; danach immer den
  * NEUESTEN dirty-Snapshot. Weil `drain()` sequentiell awaited, kann kein älteres Ergebnis ein neueres
@@ -83,7 +96,8 @@ class SaveController {
 }
 
 function ExcalidrawEditor({ filePath, host }: { filePath: string; host: PluginRendererHost }): JSX.Element {
-  const [phase, setPhase] = useState<'loading' | 'ready' | 'load-error'>('loading')
+  const [phase, setPhase] = useState<'loading' | 'ready' | 'load-error' | 'font-error'>('loading')
+  const [fontError, setFontError] = useState<string>('')
   const [initialData, setInitialData] = useState<ReturnType<typeof restore> | null>(null)
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'error'>('idle')
   const [theme, setTheme] = useState<'light' | 'dark'>(host.theme)
@@ -120,6 +134,37 @@ function ExcalidrawEditor({ filePath, host }: { filePath: string; host: PluginRe
           }
         }
         if (cancelled) return
+        // F01+F10 (fail-closed): die eingebetteten Canvas-Fonts laden, BEVOR Excalidraw rendert/misst — sonst
+        // misst measureText gegen den System-Fallback und persistiert falsche Textgeometrie (Cross-Tool/Cross-
+        // OS-Drift). Wir rufen FontFace.load() auf den CSS-registrierten data:-Faces auf (NICHT
+        // document.fonts.load(, das im Excalidraw-Bundle neutralisiert + vom Gate verboten ist). WICHTIG (F10):
+        // Fehler NICHT verschlucken — scheitert eine unterstützte Familie (CSP-Regression, korruptes data:-
+        // Asset, Decode-Fehler), gehen wir in 'font-error' + read-only statt still falsche Geometrie zu schreiben.
+        const fontFail: string[] = []
+        for (const family of SUPPORTED_FONT_FAMILIES) {
+          const faces = [...document.fonts].filter((ff) => ff.family === family)
+          if (faces.length === 0) {
+            fontFail.push(`${family}: kein Face registriert`)
+            continue
+          }
+          try {
+            await Promise.all(faces.map((ff) => ff.load()))
+          } catch (e) {
+            fontFail.push(`${family}: load-Fehler (${e instanceof Error ? e.message : String(e)})`)
+            continue
+          }
+          // Status prüfen statt document.fonts.check() — letzteres ist weight-sensibel (Nunito ist als 500
+          // eingebettet, check('16px Nunito') fragt aber 400) und würde falsch-negativ melden.
+          const notLoaded = faces.filter((ff) => ff.status !== 'loaded')
+          if (notLoaded.length > 0) fontFail.push(`${family}: ${notLoaded.length}/${faces.length} Face(s) nicht 'loaded'`)
+        }
+        if (cancelled) return
+        if (fontFail.length > 0) {
+          host.log('Font-Preload fehlgeschlagen (fail-closed, read-only):', fontFail)
+          setFontError(fontFail.join('; '))
+          setPhase('font-error')
+          return
+        }
         const restored = restore(scene as never, null, null)
         setInitialData(restored)
         // Baseline setzen BEVOR Editing aktiv wird (Hydration-Guard über phase==='ready').
@@ -154,6 +199,16 @@ function ExcalidrawEditor({ filePath, host }: { filePath: string; host: PluginRe
   if (phase === 'loading') return <div style={msgStyle}>Lädt …</div>
   if (phase === 'load-error') {
     return <div style={msgStyle}>Datei konnte nicht geladen werden (ungültiges JSON). Bearbeitung deaktiviert, um Datenverlust zu vermeiden.</div>
+  }
+  if (phase === 'font-error') {
+    return (
+      <div style={msgStyle}>
+        Schriften konnten nicht geladen werden — Bearbeitung ist deaktiviert (read-only), um falsche, dauerhaft
+        gespeicherte Textgeometrie zu vermeiden.
+        <br />
+        <span style={{ fontSize: 11, opacity: 0.7 }}>{fontError}</span>
+      </div>
+    )
   }
 
   return (
@@ -199,33 +254,14 @@ const saveStyle: React.CSSProperties = {
   pointerEvents: 'none',
 }
 
-// F02: Excalidraw lädt seine Fonts zur Laufzeit vom esm.sh-CDN (hardcodierter ASSETS_FALLBACK_URL im
-// Bundle) via FontFace.load() → die Host-CSP (default-src 'self') blockt jeden der ~230 Subsets (Konsolen-
-// Noise). Wir wollen KEIN Netzwerk-Font-Loading (Privacy + sauberes Log); Text nutzt den System-Fallback.
-// Da die Ladepfade minifiziert + mehrfach sind, ist der robusteste mechanismus-unabhängige Punkt der
-// globale FontFace.load-Prototype: no-oppen bei aktivem Editor, beim Deactivate wiederherstellen. Der Host
-// lädt seine eigenen Fonts beim App-Start (VOR Plugin-Aktivierung) → bleibt unberührt.
-type FontFaceLoad = (typeof FontFace)['prototype']['load']
-let originalFontFaceLoad: FontFaceLoad | null = null
-function suppressFontLoading(): void {
-  if (typeof FontFace === 'undefined' || originalFontFaceLoad) return
-  originalFontFaceLoad = FontFace.prototype.load
-  FontFace.prototype.load = function (this: FontFace) {
-    return Promise.resolve(this)
-  }
-}
-function restoreFontLoading(): void {
-  if (originalFontFaceLoad) {
-    FontFace.prototype.load = originalFontFaceLoad
-    originalFontFaceLoad = null
-  }
-}
-
+// Font-Strategie (F01/F02): Excalidraws eigener CDN-Font-Loadpfad ist im Build (build.mjs) neutralisiert;
+// die 3 Canvas-Default-Familien werden als data:-@font-face mitgeliefert (styles.css) und pro Editor-Mount
+// via FontFace.load() vorgeladen (siehe oben), damit measureText echte Metriken bekommt. KEIN globaler
+// FontFace-Prototype-Override mehr (der würde die eigenen data:-Fonts blockieren).
 const plugin: PluginRendererModule = {
   id: 'mindgraph-excalidraw',
   activate(host) {
     host.log('Excalidraw-Plugin aktiviert')
-    suppressFontLoading()
     let root: Root | null = null
     host.registerFileEditor({
       editorId: 'excalidraw',
@@ -238,9 +274,6 @@ const plugin: PluginRendererModule = {
         }
       },
     })
-  },
-  deactivate() {
-    restoreFontLoading()
   },
 }
 
