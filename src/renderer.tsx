@@ -10,7 +10,7 @@
 //          dem Renderer-Teardown, daher wird kontinuierlich (debounced) während des Editierens gespeichert.
 // F05: Excalidraws native Datei-/Export-Oberflächen (Öffnen/Speichern/Export/Menu) sind abgeschaltet.
 
-import { Excalidraw, MainMenu, serializeAsJSON, restore, FONT_FAMILY } from '@excalidraw/excalidraw'
+import { Excalidraw, MainMenu, serializeAsJSON, restore, exportToSvg, FONT_FAMILY } from '@excalidraw/excalidraw'
 import { createRoot, type Root } from 'react-dom/client'
 import { useCallback, useEffect, useRef, useState } from 'react'
 
@@ -18,6 +18,8 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 interface PluginRendererHost {
   readonly id: string
   registerFileEditor(opts: { editorId: string; mount: FileEditorMount }): void
+  /** Read-only-Inline-Embed (R2, Host-API ≥0.2.1) — optional, ältere Hosts kennen es nicht. */
+  registerFileEmbed?(opts: { editorId: string; mount: FileEditorMount }): void
   readonly vault: {
     read(p: string): Promise<string>
     exists(p: string): Promise<boolean>
@@ -298,6 +300,83 @@ const saveStyle: React.CSSProperties = {
   pointerEvents: 'none',
 }
 
+/**
+ * Read-only-Inline-Embed (R2): rendert die Zeichnung als statisches SVG via exportToSvg — KEIN
+ * Excalidraw-Canvas pro Embed (mehrere Embeds pro Notiz bleiben billig), KEIN vault.write (Vertrag).
+ *
+ * Fonts: skipInliningFonts (der Subsetting-Worker ist im Build zu No-Ops geshimmt — Inlining würde
+ * scheitern). Das SVG steht INLINE im Dokument, dessen data:-@font-face (styles.css, vom Host global
+ * appliziert) die Familien auflöst. Nicht eingebettete Familien (Helvetica/CJK) fallen auf Systemfonts
+ * zurück — fürs read-only ANZEIGEN akzeptabel (exportToSvg nutzt die GESPEICHERTE Geometrie, es wird
+ * nichts neu gemessen oder geschrieben; der fail-closed-Pfad gilt nur für den schreibenden Editor).
+ */
+function mountEmbed(container: HTMLElement, ctx: { filePath: string; host: PluginRendererHost }): () => void {
+  let disposed = false
+
+  const showMsg = (text: string): void => {
+    container.textContent = ''
+    const msg = document.createElement('div')
+    msg.style.cssText = 'display:flex;align-items:center;justify-content:center;height:100%;padding:16px;color:var(--text-secondary,#888);font-size:13px;text-align:center;'
+    msg.textContent = text
+    container.appendChild(msg)
+  }
+
+  const render = async (theme: 'light' | 'dark'): Promise<void> => {
+    try {
+      const content = await ctx.host.vault.read(ctx.filePath)
+      if (disposed) return
+      if (!content || !content.trim()) {
+        showMsg('Leere Zeichnung — „Öffnen" startet den Editor.')
+        return
+      }
+      const restored = restore(JSON.parse(content) as never, null, null)
+      if (restored.elements.length === 0) {
+        showMsg('Leere Zeichnung — „Öffnen" startet den Editor.')
+        return
+      }
+      const svg = await exportToSvg({
+        elements: restored.elements,
+        appState: {
+          ...restored.appState,
+          exportBackground: true,
+          exportWithDarkMode: theme === 'dark',
+        },
+        files: restored.files ?? null,
+        exportPadding: 16,
+        skipInliningFonts: true,
+      })
+      if (disposed) return
+      // Responsiv in die feste Host-Box einpassen: viewBox sicherstellen, Größe der CSS überlassen —
+      // preserveAspectRatio (Default xMidYMid meet) skaliert und zentriert verzerrungsfrei.
+      const w = parseFloat(svg.getAttribute('width') || '0')
+      const h = parseFloat(svg.getAttribute('height') || '0')
+      if (w > 0 && h > 0 && !svg.getAttribute('viewBox')) svg.setAttribute('viewBox', `0 0 ${w} ${h}`)
+      svg.removeAttribute('width')
+      svg.removeAttribute('height')
+      svg.style.width = '100%'
+      svg.style.height = '100%'
+      svg.style.display = 'block'
+      container.textContent = ''
+      container.appendChild(svg)
+    } catch (e) {
+      if (disposed) return
+      ctx.host.log('Embed-Render fehlgeschlagen:', e)
+      showMsg('Zeichnung konnte nicht geladen werden.')
+    }
+  }
+
+  void render(ctx.host.theme)
+  const unsubTheme = ctx.host.onThemeChange((t) => {
+    void render(t)
+  })
+
+  return () => {
+    disposed = true
+    unsubTheme()
+    container.textContent = ''
+  }
+}
+
 // Font-Strategie (F01/F02): Excalidraws eigener CDN-Font-Loadpfad ist im Build (build.mjs) neutralisiert;
 // die 3 Canvas-Default-Familien werden als data:-@font-face mitgeliefert (styles.css) und pro Editor-Mount
 // via FontFace.load() vorgeladen (siehe oben), damit measureText echte Metriken bekommt. KEIN globaler
@@ -306,11 +385,12 @@ const plugin: PluginRendererModule = {
   id: 'mindgraph-excalidraw',
   activate(host) {
     host.log('Excalidraw-Plugin aktiviert')
-    let root: Root | null = null
     host.registerFileEditor({
       editorId: 'excalidraw',
       mount(container, ctx) {
-        root = createRoot(container)
+        // Root PRO Mount (v0.2.0-Fix): eine geteilte Closure-Variable würde bei parallelen Mounts
+        // (Editor-Tab + künftige Embeds, oder zwei Tabs) den jeweils anderen Root kapern.
+        let root: Root | null = createRoot(container)
         root.render(<ExcalidrawEditor filePath={ctx.filePath} host={ctx.host} />)
         return () => {
           root?.unmount()
@@ -318,6 +398,9 @@ const plugin: PluginRendererModule = {
         }
       },
     })
+    // Read-only-Embed (R2) — feature-detected: ältere Hosts (API <0.2.1) kennen den Hook nicht,
+    // dort läuft das Plugin unverändert ohne Inline-Vorschau (App zeigt den Fallback-Chip).
+    host.registerFileEmbed?.({ editorId: 'excalidraw', mount: mountEmbed })
   },
 }
 
