@@ -33,7 +33,7 @@ type FileEditorMount = (container: HTMLElement, ctx: { filePath: string; host: P
 interface PluginRendererModule {
   id: string
   activate(host: PluginRendererHost): void
-  deactivate?(): void
+  deactivate?(): void | Promise<void>
 }
 
 // F09/F10: die Canvas-Font-Familien, die build.mjs als data:-@font-face einbettet (Nicht-CJK). MUSS mit der
@@ -64,12 +64,16 @@ const EMBEDDED_FONT_IDS = new Set<number>(
  * NEUESTEN dirty-Snapshot. Weil `drain()` sequentiell awaited, kann kein älteres Ergebnis ein neueres
  * überschreiben (Out-of-Order unmöglich — die Serialisierung IST der Revisions-Guard). Ein Schreibfehler
  * behält den dirty-Snapshot (retrybar beim nächsten Edit) und meldet 'error'.
+ *
+ * Schließen (F10, 07.10.2026): `close()` nimmt keine neuen Snapshots mehr an, lässt den laufenden Drain aber
+ * zu Ende schreiben — inklusive des zuletzt eingereihten Snapshots. Vorher brach `dispose()` die Schleife ab,
+ * und eine Änderung aus den letzten 500 ms vor dem Tab-Schließen ging verloren.
  */
 class SaveController {
   private saved = ''
   private dirty: string | null = null
-  private writing = false
-  private disposed = false
+  private draining: Promise<void> | null = null
+  private closed = false
   constructor(
     private readonly write: (json: string) => Promise<void>,
     private readonly onStatus: (s: 'idle' | 'saving' | 'error') => void,
@@ -80,15 +84,14 @@ class SaveController {
     this.saved = json
   }
   schedule(json: string): void {
-    if (this.disposed || json === this.saved) return
+    if (this.closed || json === this.saved) return
     this.dirty = json
-    if (!this.writing) void this.drain()
+    if (!this.draining) this.draining = this.drain().finally(() => { this.draining = null })
   }
   private async drain(): Promise<void> {
-    this.writing = true
     this.onStatus('saving')
     try {
-      while (!this.disposed && this.dirty !== null && this.dirty !== this.saved) {
+      while (this.dirty !== null && this.dirty !== this.saved) {
         const attempt = this.dirty
         await this.write(attempt) // ≤1 in flight, sequentiell
         this.saved = attempt
@@ -96,15 +99,33 @@ class SaveController {
       }
       this.onStatus('idle')
     } catch (e) {
-      this.onError(e) // dirty bleibt → retrybar
+      this.onError(e) // dirty bleibt → retrybar (solange nicht geschlossen)
       this.onStatus('error')
-    } finally {
-      this.writing = false
     }
   }
-  dispose(): void {
-    this.disposed = true
+  /** Keine neuen Snapshots mehr; Promise erfüllt sich, wenn alles Eingereihte geschrieben (oder gescheitert) ist. */
+  close(): Promise<void> {
+    this.closed = true
+    return this.draining ?? Promise.resolve()
   }
+}
+
+// F10: Schreibvorgänge, die ein geschlossener Editor noch zu Ende bringt — pro Datei der letzte. Ein sofort
+// wieder geöffneter Editor wartet darauf, bevor er liest; sonst lädt er den alten Stand und überschreibt den
+// gerade gesicherten beim nächsten Edit.
+//
+// Grenze (gemessen 07.10.2026): Beim Abschalten/Aktualisieren des Plugins schließt der Host das Call-Gate,
+// BEVOR er die Mounts abbaut (Drain-Reihenfolge aus dem Renderer-Host-ADR). Ein Speichern aus dem Abbau heraus
+// wird dann mit „Renderer-Instanz nicht aktiv“ abgelehnt. Verloren geht dabei höchstens, was in den letzten
+// 500 ms vor dem Abschalten gezeichnet wurde; ein laufender Schreibvorgang wird vom Host-Drain noch abgewartet.
+const closingWrites = new Map<string, Promise<void>>()
+
+function trackClosingWrite(filePath: string, done: Promise<void>): void {
+  const p = done.catch(() => {}) // Fehler meldet der Controller selbst; hier nur Reihenfolge
+  closingWrites.set(filePath, p)
+  void p.then(() => {
+    if (closingWrites.get(filePath) === p) closingWrites.delete(filePath)
+  })
 }
 
 function ExcalidrawEditor({ filePath, host }: { filePath: string; host: PluginRendererHost }): JSX.Element {
@@ -115,6 +136,8 @@ function ExcalidrawEditor({ filePath, host }: { filePath: string; host: PluginRe
   const [theme, setTheme] = useState<'light' | 'dark'>(host.theme)
   const controllerRef = useRef<SaveController | null>(null)
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // F10: letzter onChange-Stand, der noch im Debounce hängt (noch nicht an den Controller übergeben).
+  const pendingSceneRef = useRef<{ elements: readonly unknown[]; appState: unknown; files: unknown } | null>(null)
   const mountedRef = useRef(true)
 
   useEffect(() => host.onThemeChange((t) => mountedRef.current && setTheme(t)), [host])
@@ -130,8 +153,24 @@ function ExcalidrawEditor({ filePath, host }: { filePath: string; host: PluginRe
     controllerRef.current = controller
     setPhase('loading')
 
+    // F10: Hängendes sofort einreihen (statt den Debounce-Timer zu verwerfen).
+    const flushPending = (): void => {
+      if (debounceRef.current) {
+        clearTimeout(debounceRef.current)
+        debounceRef.current = null
+      }
+      const pending = pendingSceneRef.current
+      pendingSceneRef.current = null
+      if (pending) {
+        controller.schedule(serializeAsJSON(pending.elements as never, pending.appState as never, pending.files as never, 'local'))
+      }
+    }
+
     void (async () => {
       try {
+        // F10: ein gerade geschlossener Editor derselben Datei schreibt evtl. noch — erst danach lesen.
+        await closingWrites.get(filePath)
+        if (cancelled) return
         let scene: unknown = { elements: [], appState: {}, files: {} }
         if (await host.vault.exists(filePath)) {
           const content = await host.vault.read(filePath)
@@ -214,8 +253,10 @@ function ExcalidrawEditor({ filePath, host }: { filePath: string; host: PluginRe
     return () => {
       cancelled = true
       mountedRef.current = false
-      if (debounceRef.current) clearTimeout(debounceRef.current)
-      controller.dispose()
+      // F10: KEIN Verwerfen mehr — Hängendes schreiben und den Drain zu Ende laufen lassen. Der Host baut beim
+      // Tab-Schließen nur diesen Mount ab; das Plugin und sein Vault-Zugang bleiben bestehen.
+      flushPending()
+      trackClosingWrite(filePath, controller.close())
     }
   }, [filePath, host])
 
@@ -223,8 +264,13 @@ function ExcalidrawEditor({ filePath, host }: { filePath: string; host: PluginRe
     (elements: readonly unknown[], appState: unknown, files: unknown) => {
       if (phase !== 'ready') return // Hydration-Guard: kein Autosave vor geladener Szene
       if (debounceRef.current) clearTimeout(debounceRef.current)
+      pendingSceneRef.current = { elements, appState, files }
       debounceRef.current = setTimeout(() => {
-        const json = serializeAsJSON(elements as never, appState as never, files as never, 'local')
+        debounceRef.current = null
+        const pending = pendingSceneRef.current
+        pendingSceneRef.current = null
+        if (!pending) return
+        const json = serializeAsJSON(pending.elements as never, pending.appState as never, pending.files as never, 'local')
         controllerRef.current?.schedule(json)
       }, 500)
     },
