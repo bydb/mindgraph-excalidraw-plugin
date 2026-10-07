@@ -93,7 +93,7 @@ export const EMBEDDED_FONTS = [
 // Ein Excalidraw-Update kann Funktionsnamen/Minifizierung ändern → ein Regex matcht 0× → der Build bliebe
 // grün, aber die esm.sh-Font-Fetches (+230 CSP-Fehler) kämen still zurück. Nach dem Build wird gegen erwartete
 // Mindest-Counts + einen Post-Build-Grep asserted (Build rot bei Miss). Siehe Font-Shim-Gate in build().
-const fontPatchCounts = { createUrls: 0, loadFontFaces: 0, fontsLoad: 0, fetchFont: 0, genFontFace: 0, swatchTitle: 0 }
+const fontPatchCounts = { createUrls: 0, loadFontFaces: 0, fontsLoad: 0, fetchFont: 0, genFontFace: 0, swatchTitle: 0, legacyFilePicker: 0 }
 function countReplace(code, re, repl, key) {
   const m = code.match(re)
   if (m) fontPatchCounts[key] += re.global ? m.length : 1
@@ -161,6 +161,25 @@ const fontSubsettingShimPlugin = {
       //     (`--swatch-color`-Var == `title`-Var). Toolbar-/andere Tooltips (`.excalidraw-tooltip`) bleiben.
       code = countReplace(code, /("--swatch-color":([A-Za-z_$][\w$]*)\},type:"button",)title:\2,/, '$1', 'swatchTitle')
 
+      return { contents: code, loader: 'js' }
+    })
+
+    // (7) Datei-Öffnen über das klassische <input type="file"> statt showOpenFilePicker (07.10.2026).
+    //     browser-fs-access entscheidet beim Laden: gibt es `showOpenFilePicker`, liest es die gewählte
+    //     Datei per FileSystemFileHandle.getFile() — das braucht in Electron die Berechtigung `fileSystem`,
+    //     die der Host verweigert. Bild-Werkzeug und „Bibliothek öffnen" scheiterten so mit NotAllowedError.
+    //     Eine Host-Freigabe ließe sich nicht auf das Hauptfenster begrenzen (der Prüf-Handler bekommt dort
+    //     weder WebContents noch URL, nur die Herkunft — gemessen). Das Dateifeld braucht keine Berechtigung:
+    //     der Nutzer wählt im OS-Dialog, der Browser reicht genau diese Datei herein. Betrifft auch die
+    //     (abgeschalteten) Speichern-Pfade, die dann über <a download> laufen würden.
+    //     Review: mindgraph-notes/docs/codex-collab/excalidraw-vollumfang.md (F01/F02).
+    build.onLoad({ filter: /[/\\]browser-fs-access[/\\]dist[/\\]index\.mjs$/ }, (args) => {
+      const code = countReplace(
+        readFileSync(args.path, 'utf8'),
+        /else if\("showOpenFilePicker"in self\)return"showOpenFilePicker"/,
+        'else if(false)return"showOpenFilePicker"',
+        'legacyFilePicker',
+      )
       return { contents: code, loader: 'js' }
     })
   },
@@ -256,7 +275,7 @@ async function build() {
   const exVersion = JSON.parse(readFileSync(resolve(excalidrawDir, '../../package.json'), 'utf-8')).version
   if (exVersion !== '0.18.1') gateFail.push(`@excalidraw/excalidraw@${exVersion} ≠ 0.18.1 — Font-Patch neu auditieren`)
   // (b) exakte Patch-Counts
-  const EXPECT_COUNTS = { createUrls: 1, loadFontFaces: 1, fontsLoad: 2, fetchFont: 1, genFontFace: 1, swatchTitle: 1 }
+  const EXPECT_COUNTS = { createUrls: 1, loadFontFaces: 1, fontsLoad: 2, fetchFont: 1, genFontFace: 1, swatchTitle: 1, legacyFilePicker: 1 }
   for (const [key, exact] of Object.entries(EXPECT_COUNTS)) {
     if (fontPatchCounts[key] !== exact) gateFail.push(`Patch-Count ${key}=${fontPatchCounts[key]} (erwartet exakt ${exact})`)
   }
@@ -264,6 +283,7 @@ async function build() {
   if (/(?:window\.)?document\.fonts\.load\(/.test(jsCode)) gateFail.push('lebendes document.fonts.load( im Bundle')
   if (/\.fonts\.add\(/.test(jsCode)) gateFail.push('lebendes .fonts.add( im Bundle')
   if (/Accept:\s*["']font\/woff2["']/.test(jsCode)) gateFail.push('lebender Font-fetch (Accept:font/woff2) im Bundle')
+  if (/"showOpenFilePicker"\s*in\s*self/.test(jsCode)) gateFail.push('lebende showOpenFilePicker-Erkennung im Bundle (Patch 7)')
   // (d) CSS-Asserts (F03)
   const styleCss = readFileSync(resolve(__dirname, 'dist/styles.css'), 'utf-8')
   if (cssFaceStripCount < 1) gateFail.push('CSS-@font-face-Strip matchte 0× (erwartet ≥1)')

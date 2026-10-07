@@ -1,7 +1,7 @@
 {
   "manifestVersion": 2,
   "id": "mindgraph-excalidraw",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "label": "Excalidraw",
   "description": "Handgezeichneter Zeichen-Editor für .excalidraw-Dateien.",
   "category": "documents",
