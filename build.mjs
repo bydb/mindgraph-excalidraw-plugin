@@ -152,8 +152,16 @@ const fontSubsettingShimPlugin = {
         'fetchFont',
       )
 
-      // (5) generateFontFaceDeclarations → return[] (SVG-Export-Font-CSS-Pfad abtöten)
-      code = countReplace(code, /(static async generateFontFaceDeclarations\([^)]*\)\s*\{)/, '$1return[];', 'genFontFace')
+      // (5) generateFontFaceDeclarations → Plugin-Hook statt Excalidraws Pfad (Subsetting-Worker + CDN-Fetch).
+      //     Der Hook (renderer.tsx `exportFontFaces`) liefert die bereits eingebetteten data:-@font-face-Regeln
+      //     für die im Export benutzten Familien und Teilsätze — SVG-Export mit Schriften, ohne Netz (F05,
+      //     07.10.2026). Ohne Hook (sollte nie vorkommen) bleibt es beim alten `[]`.
+      code = countReplace(
+        code,
+        /(static async generateFontFaceDeclarations\(([^)]*)\)\s*\{)/,
+        '$1return(globalThis.__mgExcalidrawExportFontFaces?globalThis.__mgExcalidrawExportFontFaces($2):[]);',
+        'genFontFace',
+      )
 
       // (6) Farb-Swatch-Tooltip abschalten (User-Wunsch): das native `title:<hex>` am Farb-Swatch-Button
       //     entfernen. Im eingebetteten App-Kontext rendert der Browser diesen nativen Tooltip beim Hover
@@ -242,6 +250,11 @@ async function build() {
   // Host grundsätzlich verweigert — er täte nichts. Eigene .excalidrawlib-Dateien lassen sich weiter über das
   // Bibliotheksmenü öffnen (Codex F06: Online-Katalog nur als ausdrücklicher Weg, nicht als toter Knopf).
   cssContent += '\n.excalidraw .library-menu-browse-button{display:none!important}\n'
+  // „Assistant“ (Excalidraws UI-Schrift) kam vom CDN und ist mit den übrigen @font-face entfernt. 7 Regeln
+  // nennen sie OHNE Rückfall → Dialog-Überschriften fielen auf eine Serifenschrift. Auf die vorhandene
+  // Kette --ui-font (Systemschrift) umbiegen.
+  cssContent = cssContent.replace(/font-family:\s*Assistant\s*(?=[;}])/g, 'font-family:var(--ui-font)')
+  if (/font-family:\s*Assistant\s*[;}]/.test(cssContent)) throw new Error('UI-Schrift-Umbiegung unvollständig')
   writeFileSync(resolve(__dirname, 'dist/styles.css'), cssContent)
 
   // Manifest neben die Entrypoints legen → dist/ = das vollständige Artefakt (manifest + entrypoints),

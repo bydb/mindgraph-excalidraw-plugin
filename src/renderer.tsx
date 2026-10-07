@@ -68,6 +68,74 @@ const EMBEDDED_FONT_IDS = new Set<number>(
     .filter((id): id is number => typeof id === 'number'),
 )
 
+// ─── SVG-Export: Schriften einbetten (F05) ─────────────────────────────────────────────────────────
+// Excalidraws eigener Weg (Font-Subsetting im Worker + Laden vom CDN) ist im Build abgeschaltet (Font-Review
+// F01/F02). build.mjs leitet `Fonts.generateFontFaceDeclarations(elements)` deshalb auf diesen Hook um: er
+// nimmt die BEREITS eingebetteten data:-@font-face-Regeln aus unserem Stylesheet — nur für die Familien, die
+// im Export vorkommen, und nur die Teilsätze (unicode-range), deren Zeichen auch benutzt werden. So bleibt eine
+// exportierte SVG auf einem fremden Rechner lesbar, ohne Netz und ohne den gesperrten Worker.
+const FONT_NAME_BY_ID = new Map<number, string>(
+  Object.entries(FONT_FAMILY as Record<string, number>).map(([name, id]) => [id, name]),
+)
+
+function parseUnicodeRange(range: string): Array<[number, number]> {
+  return range
+    .split(',')
+    .map((part) => part.trim().replace(/^u\+/i, ''))
+    .filter(Boolean)
+    .map((part) => {
+      const [a, b] = part.split('-')
+      const lo = parseInt(a.replace(/\?/g, '0'), 16)
+      const hi = parseInt((b ?? a).replace(/\?/g, 'f'), 16)
+      return [lo, hi] as [number, number]
+    })
+    .filter(([lo, hi]) => Number.isFinite(lo) && Number.isFinite(hi))
+}
+
+function exportFontFaces(elements: ReadonlyArray<{ type?: string; fontFamily?: number; text?: string; isDeleted?: boolean }>): string[] {
+  const charsByFamily = new Map<string, Set<number>>()
+  for (const el of elements) {
+    if (el?.isDeleted || el?.type !== 'text' || typeof el.fontFamily !== 'number') continue
+    const family = FONT_NAME_BY_ID.get(el.fontFamily)
+    if (!family) continue
+    const set = charsByFamily.get(family) ?? new Set<number>()
+    for (const ch of el.text ?? '') set.add(ch.codePointAt(0) ?? 0)
+    charsByFamily.set(family, set)
+  }
+  if (charsByFamily.size === 0) return []
+  const out: string[] = []
+  for (const sheet of Array.from(document.styleSheets)) {
+    let rules: CSSRuleList
+    try {
+      rules = sheet.cssRules
+    } catch {
+      continue // fremdes Stylesheet ohne Lesezugriff
+    }
+    for (const rule of Array.from(rules)) {
+      if (!(rule instanceof CSSFontFaceRule)) continue
+      const family = rule.style.getPropertyValue('font-family').replace(/^["']|["']$/g, '').trim()
+      const chars = charsByFamily.get(family)
+      if (!chars) continue
+      if (!/url\(\s*["']?data:/.test(rule.style.getPropertyValue('src'))) continue // nur eingebettete Fassungen
+      const range = rule.style.getPropertyValue('unicode-range')
+      if (range) {
+        const ranges = parseUnicodeRange(range)
+        let used = false
+        for (const cp of chars) {
+          if (ranges.some(([lo, hi]) => cp >= lo && cp <= hi)) {
+            used = true
+            break
+          }
+        }
+        if (!used) continue
+      }
+      out.push(rule.cssText)
+    }
+  }
+  return Array.from(new Set(out))
+}
+;(globalThis as { __mgExcalidrawExportFontFaces?: typeof exportFontFaces }).__mgExcalidrawExportFontFaces = exportFontFaces
+
 /**
  * Serialisierter, coalescender Save-Controller (F03): höchstens EIN vault.write in flight; danach immer den
  * NEUESTEN dirty-Snapshot. Weil `drain()` sequentiell awaited, kann kein älteres Ergebnis ein neueres
@@ -443,6 +511,8 @@ function ExcalidrawEditor({ filePath, host }: { filePath: string; host: PluginRe
         initialData={initialData as never}
         theme={theme}
         langCode={langCode}
+        // Vorschlag für Exportnamen („skizze.png“ statt „Unbenannt-…“).
+        name={filePath.split(/[\\/]/).pop()?.replace(/\.excalidraw$/i, '') || undefined}
         excalidrawAPI={onExcalidrawApi as never}
         onLibraryChange={(items: readonly unknown[]) => libraryStore.changed(libraryApiRef.current, items)}
         // Keine KI-Funktionen, die einen Excalidraw-Server bräuchten (lokal-first). Mermaid bleibt — lokal.
@@ -458,6 +528,7 @@ function ExcalidrawEditor({ filePath, host }: { filePath: string; host: PluginRe
         }}
       >
         <MainMenu>
+          <MainMenu.DefaultItems.SaveAsImage />
           <MainMenu.DefaultItems.CommandPalette />
           <MainMenu.DefaultItems.SearchMenu />
           <MainMenu.DefaultItems.Help />
