@@ -238,6 +238,10 @@ async function build() {
   // Alle originalen @font-face (esm.sh/relative Font-URLs) restlos entfernen; Count fürs F03-Gate merken.
   const cssFaceStripCount = (cssContent.match(/@font-face\s*\{[^}]*\}/g) || []).length
   cssContent = `${dataFontFaces}${cssContent.replace(/@font-face\s*\{[^}]*\}/g, '')}`
+  // „Bibliotheken durchsuchen“ ausblenden: der Knopf öffnet libraries.excalidraw.com per window.open, das der
+  // Host grundsätzlich verweigert — er täte nichts. Eigene .excalidrawlib-Dateien lassen sich weiter über das
+  // Bibliotheksmenü öffnen (Codex F06: Online-Katalog nur als ausdrücklicher Weg, nicht als toter Knopf).
+  cssContent += '\n.excalidraw .library-menu-browse-button{display:none!important}\n'
   writeFileSync(resolve(__dirname, 'dist/styles.css'), cssContent)
 
   // Manifest neben die Entrypoints legen → dist/ = das vollständige Artefakt (manifest + entrypoints),

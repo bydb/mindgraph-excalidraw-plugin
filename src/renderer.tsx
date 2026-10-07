@@ -10,7 +10,16 @@
 //          dem Renderer-Teardown, daher wird kontinuierlich (debounced) während des Editierens gespeichert.
 // F05: Excalidraws native Datei-/Export-Oberflächen (Öffnen/Speichern/Export/Menu) sind abgeschaltet.
 
-import { Excalidraw, MainMenu, serializeAsJSON, restore, exportToSvg, FONT_FAMILY } from '@excalidraw/excalidraw'
+import {
+  Excalidraw,
+  MainMenu,
+  serializeAsJSON,
+  serializeLibraryAsJSON,
+  restore,
+  restoreLibraryItems,
+  exportToSvg,
+  FONT_FAMILY,
+} from '@excalidraw/excalidraw'
 import { createRoot, type Root } from 'react-dom/client'
 import { useCallback, useEffect, useRef, useState } from 'react'
 
@@ -128,12 +137,122 @@ function trackClosingWrite(filePath: string, done: Promise<void>): void {
   })
 }
 
+// ─── Bibliothek (Library) — eine pro Vault ─────────────────────────────────────────────────────────
+// Liegt als JSON unter .mindgraph/, damit der Sync sie mitnimmt (JSON in .mindgraph wird synchronisiert;
+// .excalidrawlib nicht). Inhalt = das normale .excalidrawlib-Format (serializeLibraryAsJSON).
+//
+// Regeln (Codex F06): geladen wird VOR dem ersten Rendern (initialData.libraryItems), geschrieben über
+// denselben serialisierten SaveController wie die Zeichnung. Eine unlesbare Datei wird NIE überschrieben —
+// Änderungen bleiben dann ungespeichert und der Editor sagt das. Mehrere offene Editoren werden gleich-
+// gezogen (updateLibrary), sonst überschriebe der zweite Tab die Ergänzungen des ersten.
+const LIBRARY_PATH = '.mindgraph/excalidraw-library.json'
+
+interface LibraryApi {
+  updateLibrary(opts: { libraryItems: unknown; merge?: boolean }): Promise<unknown>
+}
+
+class LibraryStore {
+  private items: unknown[] = []
+  private lastJson = ''
+  private loading: Promise<void> | null = null
+  private controller: SaveController | null = null
+  private readonly editors = new Set<LibraryApi>()
+  private readonly statusListeners = new Set<(broken: boolean) => void>()
+  broken = false
+
+  /** Liest die Datei neu, solange kein Editor offen ist (so kommen per Sync geänderte Bibliotheken an). */
+  async load(host: PluginRendererHost): Promise<unknown[]> {
+    if (this.editors.size === 0 && !this.loading) this.loading = this.read(host).finally(() => { this.loading = null })
+    if (this.loading) await this.loading
+    return this.items
+  }
+
+  private async read(host: PluginRendererHost): Promise<void> {
+    if (!this.controller) {
+      this.controller = new SaveController(
+        (json) => host.vault.write(LIBRARY_PATH, json),
+        () => {},
+        (e) => host.log('Bibliothek speichern fehlgeschlagen:', e),
+      )
+    }
+    let items: unknown[] = []
+    let broken = false
+    try {
+      if (await host.vault.exists(LIBRARY_PATH)) {
+        const content = await host.vault.read(LIBRARY_PATH)
+        if (content.trim()) {
+          const parsed = JSON.parse(content) as { libraryItems?: unknown; library?: unknown }
+          const raw = parsed.libraryItems ?? parsed.library ?? []
+          if (!Array.isArray(raw)) throw new Error('libraryItems ist keine Liste')
+          items = restoreLibraryItems(raw as never, 'unpublished') as unknown[]
+        }
+      }
+    } catch (e) {
+      host.log('Bibliothek unlesbar — wird nicht überschrieben:', e)
+      broken = true
+    }
+    this.items = items
+    this.lastJson = serializeLibraryAsJSON(items as never)
+    this.controller.setBaseline(this.lastJson)
+    this.setBroken(broken)
+  }
+
+  private setBroken(broken: boolean): void {
+    this.broken = broken
+    for (const l of this.statusListeners) l(broken)
+  }
+
+  onStatus(cb: (broken: boolean) => void): () => void {
+    this.statusListeners.add(cb)
+    return () => this.statusListeners.delete(cb)
+  }
+
+  attach(api: LibraryApi): () => void {
+    this.editors.add(api)
+    return () => this.editors.delete(api)
+  }
+
+  /** onLibraryChange eines Editors: speichern und die anderen offenen Editoren gleichziehen. */
+  changed(source: LibraryApi | null, items: readonly unknown[]): void {
+    const json = serializeLibraryAsJSON(items as never)
+    if (json === this.lastJson) return // eigenes Echo oder Initial-Callback
+    this.items = [...items]
+    this.lastJson = json
+    if (!this.broken) this.controller?.schedule(json)
+    for (const api of this.editors) {
+      if (api !== source) void api.updateLibrary({ libraryItems: this.items, merge: false })
+    }
+  }
+}
+const libraryStore = new LibraryStore()
+
+/**
+ * Oberflächensprache aus <html lang> (setzt die App aus ihrer Spracheinstellung) — folgt Änderungen live.
+ * Excalidraw schreibt beim Sprachwechsel selbst `document.documentElement.lang` (z. B. „de-DE“); das löst den
+ * Observer erneut aus, bildet aber auf denselben Code ab — kein Pingpong.
+ */
+function appLangCode(): string {
+  return (document.documentElement.lang || 'de').toLowerCase().startsWith('en') ? 'en' : 'de-DE'
+}
+function useAppLangCode(): string {
+  const [code, setCode] = useState(appLangCode)
+  useEffect(() => {
+    const obs = new MutationObserver(() => setCode(appLangCode()))
+    obs.observe(document.documentElement, { attributes: true, attributeFilter: ['lang'] })
+    return () => obs.disconnect()
+  }, [])
+  return code
+}
+
 function ExcalidrawEditor({ filePath, host }: { filePath: string; host: PluginRendererHost }): JSX.Element {
   const [phase, setPhase] = useState<'loading' | 'ready' | 'load-error' | 'font-error' | 'unsupported-font'>('loading')
   const [fontError, setFontError] = useState<string>('')
   const [initialData, setInitialData] = useState<ReturnType<typeof restore> | null>(null)
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'error'>('idle')
   const [theme, setTheme] = useState<'light' | 'dark'>(host.theme)
+  const langCode = useAppLangCode()
+  const [libraryBroken, setLibraryBroken] = useState(libraryStore.broken)
+  const libraryApiRef = useRef<LibraryApi | null>(null)
   const controllerRef = useRef<SaveController | null>(null)
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // F10: letzter onChange-Stand, der noch im Debounce hängt (noch nicht an den Controller übergeben).
@@ -141,6 +260,18 @@ function ExcalidrawEditor({ filePath, host }: { filePath: string; host: PluginRe
   const mountedRef = useRef(true)
 
   useEffect(() => host.onThemeChange((t) => mountedRef.current && setTheme(t)), [host])
+  useEffect(() => libraryStore.onStatus(setLibraryBroken), [])
+  // Bibliothek: Editor beim Store anmelden, sobald Excalidraw sein API-Objekt übergibt; beim Unmount ab.
+  const detachLibraryRef = useRef<(() => void) | null>(null)
+  const onExcalidrawApi = useCallback((api: unknown) => {
+    detachLibraryRef.current?.()
+    libraryApiRef.current = api as LibraryApi
+    detachLibraryRef.current = libraryStore.attach(api as LibraryApi)
+  }, [])
+  useEffect(() => () => {
+    detachLibraryRef.current?.()
+    detachLibraryRef.current = null
+  }, [])
 
   useEffect(() => {
     mountedRef.current = true
@@ -240,7 +371,10 @@ function ExcalidrawEditor({ filePath, host }: { filePath: string; host: PluginRe
         if (typeof curFont === 'number' && !EMBEDDED_FONT_IDS.has(curFont)) {
           ;(restored.appState as { currentItemFontFamily?: number }).currentItemFontFamily = FONT_FAMILY.Excalifont
         }
-        setInitialData(restored)
+        // Bibliothek VOR dem ersten Rendern laden (Codex F06: Hydration über initialData, nicht nachträglich).
+        const libraryItems = await libraryStore.load(host)
+        if (cancelled) return
+        setInitialData({ ...restored, libraryItems } as typeof restored)
         // Baseline setzen BEVOR Editing aktiv wird (Hydration-Guard über phase==='ready').
         controller.setBaseline(serializeAsJSON(restored.elements, restored.appState, restored.files ?? {}, 'local'))
         setPhase('ready')
@@ -308,6 +442,11 @@ function ExcalidrawEditor({ filePath, host }: { filePath: string; host: PluginRe
       <Excalidraw
         initialData={initialData as never}
         theme={theme}
+        langCode={langCode}
+        excalidrawAPI={onExcalidrawApi as never}
+        onLibraryChange={(items: readonly unknown[]) => libraryStore.changed(libraryApiRef.current, items)}
+        // Keine KI-Funktionen, die einen Excalidraw-Server bräuchten (lokal-first). Mermaid bleibt — lokal.
+        aiEnabled={false}
         onChange={onChange as never}
         UIOptions={{
           canvasActions: {
@@ -319,10 +458,19 @@ function ExcalidrawEditor({ filePath, host }: { filePath: string; host: PluginRe
         }}
       >
         <MainMenu>
+          <MainMenu.DefaultItems.CommandPalette />
+          <MainMenu.DefaultItems.SearchMenu />
+          <MainMenu.DefaultItems.Help />
+          <MainMenu.Separator />
           <MainMenu.DefaultItems.ChangeCanvasBackground />
           <MainMenu.DefaultItems.ClearCanvas />
         </MainMenu>
       </Excalidraw>
+      {libraryBroken && (
+        <div style={{ ...saveStyle, bottom: 36, color: '#b00', borderColor: '#b00' }}>
+          Bibliothek-Datei unlesbar ({LIBRARY_PATH}) — Änderungen an der Bibliothek werden nicht gespeichert.
+        </div>
+      )}
       {saveStatus !== 'idle' && (
         <div style={{ ...saveStyle, ...(saveStatus === 'error' ? { color: '#b00', borderColor: '#b00' } : {}) }}>
           {saveStatus === 'saving' ? 'Speichert …' : 'Speichern fehlgeschlagen — bleibt gemerkt, erneuter Versuch beim nächsten Edit.'}
