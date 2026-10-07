@@ -19,6 +19,7 @@ import {
   restoreLibraryItems,
   exportToSvg,
   FONT_FAMILY,
+  isElementLink,
 } from '@excalidraw/excalidraw'
 import { createRoot, type Root } from 'react-dom/client'
 import { useCallback, useEffect, useRef, useState } from 'react'
@@ -37,6 +38,8 @@ interface PluginRendererHost {
   readonly theme: 'light' | 'dark'
   onThemeChange(cb: (t: 'light' | 'dark') => void): () => void
   log(...args: unknown[]): void
+  /** Link öffnen (Host-API ≥0.2.2) — optional, ältere Hosts kennen es nicht. */
+  openLink?(link: string): Promise<'opened' | 'not-found' | 'refused'>
 }
 type FileEditorMount = (container: HTMLElement, ctx: { filePath: string; host: PluginRendererHost }) => () => void
 interface PluginRendererModule {
@@ -312,6 +315,33 @@ function useAppLangCode(): string {
   return code
 }
 
+// ─── Links an Elementen (Codex F07) ────────────────────────────────────────────────────────────────
+// Excalidraw öffnet Links ohne Eingriff selbst: extern per window.open (vom Host verweigert → toter Klick) und
+// „lokale“ (`/…`) per window.open(…, '_self') — das navigierte das GANZE App-Fenster weg. Deshalb wird JEDER
+// Klick abgebrochen und hier entschieden. Element-Links bekommen ein festes Format (`#element=<id>`): Excalidraws
+// Standard hängt `?element=` an die Adresse der Seite, und die ist in Dev (localhost) und App (file://)
+// verschieden — ein Link aus der einen wäre in der anderen fremd.
+const ELEMENT_LINK = /^#element=([\w-]+)$/
+
+interface EditorApi {
+  scrollToContent(target: string, opts?: { fitToContent?: boolean; animate?: boolean }): void
+  setToast(toast: { message: string; closable?: boolean; duration?: number } | null): void
+}
+
+function elementIdFromLink(link: string): string | null {
+  const own = ELEMENT_LINK.exec(link)
+  if (own) return own[1]
+  // Element-Links im Excalidraw-Format (z. B. aus älteren Zeichnungen derselben Seite)
+  if (isElementLink(link)) {
+    try {
+      return new URL(link).searchParams.get('element')
+    } catch {
+      return null
+    }
+  }
+  return null
+}
+
 function ExcalidrawEditor({ filePath, host }: { filePath: string; host: PluginRendererHost }): JSX.Element {
   const [phase, setPhase] = useState<'loading' | 'ready' | 'load-error' | 'font-error' | 'unsupported-font'>('loading')
   const [fontError, setFontError] = useState<string>('')
@@ -321,6 +351,7 @@ function ExcalidrawEditor({ filePath, host }: { filePath: string; host: PluginRe
   const langCode = useAppLangCode()
   const [libraryBroken, setLibraryBroken] = useState(libraryStore.broken)
   const libraryApiRef = useRef<LibraryApi | null>(null)
+  const editorApiRef = useRef<EditorApi | null>(null)
   const controllerRef = useRef<SaveController | null>(null)
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // F10: letzter onChange-Stand, der noch im Debounce hängt (noch nicht an den Controller übergeben).
@@ -334,6 +365,7 @@ function ExcalidrawEditor({ filePath, host }: { filePath: string; host: PluginRe
   const onExcalidrawApi = useCallback((api: unknown) => {
     detachLibraryRef.current?.()
     libraryApiRef.current = api as LibraryApi
+    editorApiRef.current = api as EditorApi
     detachLibraryRef.current = libraryStore.attach(api as LibraryApi)
   }, [])
   useEffect(() => () => {
@@ -462,6 +494,30 @@ function ExcalidrawEditor({ filePath, host }: { filePath: string; host: PluginRe
     }
   }, [filePath, host])
 
+  const onLinkOpen = useCallback(
+    (element: { link?: string | null }, event: { preventDefault(): void }) => {
+      event.preventDefault() // nie Excalidraws window.open — siehe ELEMENT_LINK
+      const link = (element.link ?? '').trim()
+      const api = editorApiRef.current
+      if (!link || !api) return
+      const elementId = elementIdFromLink(link)
+      if (elementId) {
+        api.scrollToContent(elementId, { fitToContent: true, animate: true })
+        return
+      }
+      const toast = (message: string): void => api.setToast({ message, closable: true, duration: 4000 })
+      if (!host.openLink) {
+        toast('Links öffnen braucht eine neuere Version von MindGraph Notes.')
+        return
+      }
+      void host.openLink(link).then((result) => {
+        if (result === 'not-found') toast(`Ziel nicht gefunden: ${link}`)
+        else if (result === 'refused') toast(`Dieser Link wird nicht geöffnet: ${link}`)
+      })
+    },
+    [host],
+  )
+
   const onChange = useCallback(
     (elements: readonly unknown[], appState: unknown, files: unknown) => {
       if (phase !== 'ready') return // Hydration-Guard: kein Autosave vor geladener Szene
@@ -517,6 +573,8 @@ function ExcalidrawEditor({ filePath, host }: { filePath: string; host: PluginRe
         onLibraryChange={(items: readonly unknown[]) => libraryStore.changed(libraryApiRef.current, items)}
         // Keine KI-Funktionen, die einen Excalidraw-Server bräuchten (lokal-first). Mermaid bleibt — lokal.
         aiEnabled={false}
+        onLinkOpen={onLinkOpen as never}
+        generateLinkForSelection={(id: string) => `#element=${id}`}
         onChange={onChange as never}
         UIOptions={{
           canvasActions: {
