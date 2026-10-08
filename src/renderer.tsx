@@ -20,6 +20,8 @@ import {
   exportToSvg,
   FONT_FAMILY,
   isElementLink,
+  newElementWith,
+  CaptureUpdateAction,
 } from '@excalidraw/excalidraw'
 import { createRoot, type Root } from 'react-dom/client'
 import { useCallback, useEffect, useRef, useState } from 'react'
@@ -32,6 +34,8 @@ interface PluginRendererHost {
   registerFileEmbed?(opts: { editorId: string; mount: FileEditorMount }): void
   readonly vault: {
     read(p: string): Promise<string>
+    /** Seit Host-API 0.2.0 mit `vault.read` dabei; trotzdem feature-detected aufrufen. */
+    readBytes?(p: string): Promise<Uint8Array>
     exists(p: string): Promise<boolean>
     write(p: string, c: string): Promise<void>
   }
@@ -326,6 +330,7 @@ const ELEMENT_LINK = /^#element=([\w-]+)$/
 interface EditorApi {
   scrollToContent(target: string, opts?: { fitToContent?: boolean; animate?: boolean }): void
   setToast(toast: { message: string; closable?: boolean; duration?: number } | null): void
+  updateScene(scene: { elements?: readonly unknown[]; captureUpdate?: unknown }): void
 }
 
 function elementIdFromLink(link: string): string | null {
@@ -340,6 +345,58 @@ function elementIdFromLink(link: string): string | null {
     }
   }
   return null
+}
+
+// ─── Bilder (Codex F04/F08) ────────────────────────────────────────────────────────────────────────
+// Bilder bleiben als dataURL IN der .excalidraw-Datei (portabel, gleiches Format wie excalidraw.com). Excalidraw
+// verkleinert jedes Bild beim Einfügen auf 1440 px und lehnt danach > 4 MB ab; gleiche Bilder teilen sich einen
+// Eintrag (ID = SHA-1 des Inhalts), gelöschte fallen beim Speichern heraus. `status: 'pending'` am Element ist
+// harmlos — Excalidraw liest den Status nur für den Fehler-Platzhalter, nicht beim Laden oder Exportieren.
+//
+// Was fehlte, war eine Grenze für die GANZE Zeichnung: jedes Autosave schreibt alle Bilder neu, der Sync nimmt
+// höchstens 64 MB pro Datei. Ab MAX_DRAWING_IMAGE_BYTES (Summe der dataURLs) wird ein NEU hinzugekommenes Bild
+// wieder entfernt, mit Hinweis. Bilder, die beim Öffnen schon in der Zeichnung waren, bleiben immer.
+const MAX_DRAWING_IMAGE_BYTES = 20 * 1024 * 1024
+
+type SceneElement = { id: string; type?: string; fileId?: string | null; isDeleted?: boolean }
+type SceneFiles = Record<string, { dataURL?: string } | undefined>
+
+function referencedImageBytes(elements: readonly SceneElement[], files: SceneFiles): Map<string, number> {
+  const out = new Map<string, number>()
+  for (const el of elements) {
+    if (el.isDeleted || el.type !== 'image' || !el.fileId) continue
+    const len = files[el.fileId]?.dataURL?.length
+    if (typeof len === 'number') out.set(el.fileId, len)
+  }
+  return out
+}
+
+function formatMb(bytes: number): string {
+  return `${(bytes / 1024 / 1024).toLocaleString('de-DE', { maximumFractionDigits: 1 })} MB`
+}
+
+// F08: Ein Bild aus der Dateiliste der App auf die Zeichnung ziehen. Die Dateiliste gibt nur den Vault-Pfad als
+// Text mit (`text/plain`, relativ) — Excalidraw ignoriert das. Das Plugin liest die Bytes über die Vault-Bridge
+// und reicht sie als echte Datei an Excalidraws normalen Drop-Weg weiter (Verkleinern, 4-MB-Grenze, Platzierung
+// an der Maus). Nur relative Pfade ohne Schema und ohne „..“; die Prüfung im Host (validatePath) bleibt die Grenze.
+const VAULT_IMAGE_TYPES: Record<string, string> = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  gif: 'image/gif',
+  webp: 'image/webp',
+  svg: 'image/svg+xml',
+  bmp: 'image/bmp',
+  avif: 'image/avif',
+}
+
+function vaultImageFromDrag(text: string): { path: string; name: string; type: string } | null {
+  const path = text.trim()
+  if (!path || /[\r\n]/.test(path) || path.startsWith('/') || /^[a-z][a-z0-9+.-]*:/i.test(path)) return null
+  if (path.split(/[\\/]/).includes('..')) return null
+  const name = path.split(/[\\/]/).pop() ?? ''
+  const type = VAULT_IMAGE_TYPES[name.split('.').pop()?.toLowerCase() ?? '']
+  return type ? { path, name, type } : null
 }
 
 function ExcalidrawEditor({ filePath, host }: { filePath: string; host: PluginRendererHost }): JSX.Element {
@@ -357,6 +414,9 @@ function ExcalidrawEditor({ filePath, host }: { filePath: string; host: PluginRe
   // F10: letzter onChange-Stand, der noch im Debounce hängt (noch nicht an den Controller übergeben).
   const pendingSceneRef = useRef<{ elements: readonly unknown[]; appState: unknown; files: unknown } | null>(null)
   const mountedRef = useRef(true)
+  // F04: Bilder, die die Zeichnung schon hat (beim Öffnen oder angenommen) — nur NEUE prüft die Größengrenze.
+  const knownFileIdsRef = useRef<Set<string>>(new Set())
+  const wrapperRef = useRef<HTMLDivElement | null>(null)
 
   useEffect(() => host.onThemeChange((t) => mountedRef.current && setTheme(t)), [host])
   useEffect(() => libraryStore.onStatus(setLibraryBroken), [])
@@ -474,6 +534,9 @@ function ExcalidrawEditor({ filePath, host }: { filePath: string; host: PluginRe
         // Bibliothek VOR dem ersten Rendern laden (Codex F06: Hydration über initialData, nicht nachträglich).
         const libraryItems = await libraryStore.load(host)
         if (cancelled) return
+        knownFileIdsRef.current = new Set(
+          referencedImageBytes(restored.elements as unknown as SceneElement[], (restored.files ?? {}) as SceneFiles).keys(),
+        )
         setInitialData({ ...restored, libraryItems } as typeof restored)
         // Baseline setzen BEVOR Editing aktiv wird (Hydration-Guard über phase==='ready').
         controller.setBaseline(serializeAsJSON(restored.elements, restored.appState, restored.files ?? {}, 'local'))
@@ -518,9 +581,90 @@ function ExcalidrawEditor({ filePath, host }: { filePath: string; host: PluginRe
     [host],
   )
 
+  const toast = useCallback((message: string, duration = 6000) => {
+    editorApiRef.current?.setToast({ message, closable: true, duration })
+  }, [])
+
+  /**
+   * F04: Neu hinzugekommene Bilder gegen die Grenze der ganzen Zeichnung prüfen. Zu viel → die neuen Bild-
+   * Elemente wieder entfernen (ohne Undo-Eintrag) und sagen, warum. Gibt false zurück, wenn die Szene geändert
+   * wurde — der folgende onChange speichert dann den bereinigten Stand.
+   */
+  const acceptNewImages = useCallback(
+    (elements: readonly SceneElement[], files: SceneFiles): boolean => {
+      const sizes = referencedImageBytes(elements, files)
+      const added = [...sizes.keys()].filter((id) => !knownFileIdsRef.current.has(id))
+      if (added.length === 0) return true
+      let total = 0
+      for (const n of sizes.values()) total += n
+      if (total <= MAX_DRAWING_IMAGE_BYTES) {
+        for (const id of added) knownFileIdsRef.current.add(id)
+        return true
+      }
+      const api = editorApiRef.current
+      if (!api) return true
+      const drop = new Set(added)
+      api.updateScene({
+        elements: elements.map((el) =>
+          el.type === 'image' && el.fileId && drop.has(el.fileId) && !el.isDeleted
+            ? newElementWith(el as never, { isDeleted: true } as never)
+            : el,
+        ),
+        captureUpdate: CaptureUpdateAction.NEVER,
+      })
+      toast(
+        `Bild nicht eingefügt: Die Bilder dieser Zeichnung wären zusammen ${formatMb(total)} groß ` +
+          `(Grenze ${formatMb(MAX_DRAWING_IMAGE_BYTES)}). Bilder vorher verkleinern oder auf mehrere Zeichnungen verteilen.`,
+        10000,
+      )
+      return false
+    },
+    [toast],
+  )
+
+  // F08: Bild aus der Dateiliste der App hineinziehen (siehe vaultImageFromDrag). Capture-Phase am eigenen
+  // Wrapper: läuft vor Excalidraws React-Handler; der Wiederversand trägt eine echte Datei und wird hier
+  // durchgelassen.
+  useEffect(() => {
+    const el = wrapperRef.current
+    if (phase !== 'ready' || !el) return
+    const onDrop = (e: DragEvent): void => {
+      const dt = e.dataTransfer
+      if (!dt || dt.types.includes('Files') || !dt.types.includes('text/plain')) return
+      const image = vaultImageFromDrag(dt.getData('text/plain'))
+      if (!image) return
+      e.preventDefault()
+      e.stopPropagation()
+      const target = e.target instanceof Element ? e.target : el
+      const { clientX, clientY } = e
+      void (async () => {
+        if (!host.vault.readBytes) {
+          toast('Bilder aus dem Vault einfügen braucht eine neuere Version von MindGraph Notes.')
+          return
+        }
+        let bytes: Uint8Array
+        try {
+          bytes = await host.vault.readBytes(image.path)
+        } catch (err) {
+          host.log('Bild aus dem Vault nicht lesbar:', image.path, err)
+          toast(`Bild konnte nicht gelesen werden: ${image.path}`)
+          return
+        }
+        if (!mountedRef.current) return
+        const file = new File([bytes as BlobPart], image.name, { type: image.type })
+        const transfer = new DataTransfer()
+        transfer.items.add(file)
+        target.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, clientX, clientY, dataTransfer: transfer }))
+      })()
+    }
+    el.addEventListener('drop', onDrop, true)
+    return () => el.removeEventListener('drop', onDrop, true)
+  }, [phase, host, toast])
+
   const onChange = useCallback(
     (elements: readonly unknown[], appState: unknown, files: unknown) => {
       if (phase !== 'ready') return // Hydration-Guard: kein Autosave vor geladener Szene
+      if (!acceptNewImages(elements as SceneElement[], files as SceneFiles)) return
       if (debounceRef.current) clearTimeout(debounceRef.current)
       pendingSceneRef.current = { elements, appState, files }
       debounceRef.current = setTimeout(() => {
@@ -532,7 +676,7 @@ function ExcalidrawEditor({ filePath, host }: { filePath: string; host: PluginRe
         controllerRef.current?.schedule(json)
       }, 500)
     },
-    [phase],
+    [phase, acceptNewImages],
   )
 
   if (phase === 'loading') return <div style={msgStyle}>Lädt …</div>
@@ -562,7 +706,7 @@ function ExcalidrawEditor({ filePath, host }: { filePath: string; host: PluginRe
   }
 
   return (
-    <div style={{ height: '100%', width: '100%', position: 'relative' }} data-theme={theme}>
+    <div ref={wrapperRef} style={{ height: '100%', width: '100%', position: 'relative' }} data-theme={theme}>
       <Excalidraw
         initialData={initialData as never}
         theme={theme}
